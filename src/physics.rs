@@ -36,6 +36,13 @@ pub struct Physics {
     cell_settled: Vec<Vec<bool>>,
 }
 
+/// Height from which a freshly spawned rain drop falls: a comfortable margin
+/// above the tallest possible column, so drops always start above any terrain
+/// or stacked water (terrain max + a few units of water headroom).
+fn spawn_height(terrain: &Terrain) -> f64 {
+    terrain.max_height as f64 + 10.0
+}
+
 impl Physics {
     /// Create a new physics simulator
     pub fn new(rows: usize, cols: usize) -> Self {
@@ -54,7 +61,7 @@ impl Physics {
     }
 
     /// Rain (random position is the allowed random source): accumulated by real dt; one drop per full 1 ml
-    pub fn add_rain(&mut self, dt: f64, particles: &mut ParticleSystem) {
+    pub fn add_rain(&mut self, dt: f64, particles: &mut ParticleSystem, terrain: &Terrain) {
         self.rain_acc += self.rain_rate * dt;
         let mut rng = rand::rng();
         while self.rain_acc >= 1.0 {
@@ -65,8 +72,8 @@ impl Physics {
             self.cell_settled[r][c] = false; // a new drop landed -> wake up this cell
             let x = c as f64 + rng.random_range(0.2..0.8);
             let y = r as f64 + rng.random_range(0.2..0.8);
-            // fall from high up (above any possible layer height)
-            particles.add_particle(Particle::new(x, y, 20.0));
+            // fall from well above the tallest possible column (terrain max + water headroom)
+            particles.add_particle(Particle::new(x, y, spawn_height(terrain)));
         }
     }
 
@@ -283,7 +290,11 @@ impl Physics {
                     self.cell_settled[r][c] = false;
                     for _ in 0..(desired - have) {
                         let target = self.layer_height(terrain, r, c, have + 1);
-                        let mut p = Particle::new(c as f64 + 0.5, r as f64 + 0.5, target.max(20.0));
+                        let mut p = Particle::new(
+                            c as f64 + 0.5,
+                            r as f64 + 0.5,
+                            target.max(spawn_height(terrain)),
+                        );
                         p.target_z = target;
                         particles.add_particle(p);
                     }
@@ -440,7 +451,7 @@ mod tests {
         let mut particles = ParticleSystem::new();
         // 300 frames x 0.016s x 30 particles/s ≈ 144 drops; leftover water drains along the boundary
         for _ in 0..300 {
-            physics.add_rain(0.016, &mut particles);
+            physics.add_rain(0.016, &mut particles, &terrain);
             physics.update(&mut particles, &terrain, 0.016);
         }
         assert!(particles.count() > 0, "expected rain to spawn particles");
@@ -507,7 +518,7 @@ mod tests {
         let mut particles = ParticleSystem::new();
         let start = std::time::Instant::now();
         for _ in 0..2000 {
-            physics.add_rain(0.016, &mut particles);
+            physics.add_rain(0.016, &mut particles, &terrain);
             physics.update(&mut particles, &terrain, 0.016);
             physics.water.add_water(2, 2, 1.0); // keep refilling to maintain active water flow
         }

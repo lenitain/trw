@@ -39,7 +39,9 @@ cd trw
 cargo run --release
 ```
 
-Optional: set the grid size with `--grid-size` (default 8).
+Optional: set the grid size with `--grid-size` (default 8). Terrain column
+heights scale with the grid size (max height = grid size − 1), so a larger
+grid also gets taller mountains.
 
 ```bash
 cargo run --release -- --grid-size 12

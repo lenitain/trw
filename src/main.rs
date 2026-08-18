@@ -197,8 +197,13 @@ impl App {
     }
 
     /// Generate random terrain
+    ///
+    /// Column heights scale with the grid size: max height = grid_size - 1,
+    /// so a larger grid also gets taller terrain (the default 8 keeps the
+    /// original 0..=7 range).
     fn generate_terrain(&mut self) {
-        self.terrain.generate_random(7);
+        self.terrain
+            .generate_random(self.grid_size.saturating_sub(1) as u8);
         self.particles.clear();
         self.physics.clear();
         self.trapped_water = 0;
@@ -244,7 +249,8 @@ impl App {
         if !self.raining || self.paused || self.settled {
             return;
         }
-        self.physics.add_rain(dt, &mut self.particles);
+        self.physics
+            .add_rain(dt, &mut self.particles, &self.terrain);
     }
 
     /// Update physics with real dt
@@ -1551,9 +1557,15 @@ mod tests {
     #[test]
     fn generate_rain_and_clear() {
         let mut app = App::new(4);
-        // g: generate random terrain with heights in [0, 7]
+        // g: generate random terrain; heights scale with grid size (max = grid_size - 1 = 3)
         app.handle_input(key(KeyCode::Char('g')));
-        assert!(app.terrain.heights.iter().flatten().all(|&h| h <= 7));
+        assert!(
+            app.terrain
+                .heights
+                .iter()
+                .flatten()
+                .all(|&h| h <= app.grid_size.saturating_sub(1) as u8)
+        );
 
         // rain for a while to spawn particles
         app.handle_input(key(KeyCode::Char('w')));
@@ -1565,6 +1577,22 @@ mod tests {
         assert_eq!(app.particles.count(), 0);
         assert_eq!(app.trapped_water, 0);
         assert_eq!(app.physics.water.total_water(), 0.0);
+    }
+
+    #[test]
+    fn terrain_heights_scale_with_grid_size() {
+        // larger grid -> taller possible columns
+        let mut big = App::new(16);
+        big.handle_input(key(KeyCode::Char('g')));
+        assert_eq!(big.terrain.max_height, 15);
+        assert!(big.terrain.heights.iter().flatten().all(|&h| h <= 15));
+        assert!(big.terrain.heights.iter().flatten().any(|&h| h > 7));
+
+        // smaller grid -> shorter possible columns
+        let mut small = App::new(4);
+        small.handle_input(key(KeyCode::Char('g')));
+        assert_eq!(small.terrain.max_height, 3);
+        assert!(small.terrain.heights.iter().flatten().all(|&h| h <= 3));
     }
 
     #[test]

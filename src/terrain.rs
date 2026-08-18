@@ -5,6 +5,9 @@ pub struct Terrain {
     pub heights: Vec<Vec<u8>>,
     pub rows: usize,
     pub cols: usize,
+    /// Max height used by the last random generation (0 until the first one).
+    /// Lets physics/render know how tall the tallest possible column can be.
+    pub max_height: u8,
 }
 
 impl Terrain {
@@ -15,11 +18,13 @@ impl Terrain {
             heights,
             rows,
             cols,
+            max_height: 0,
         }
     }
 
-    /// Generate terrain with random heights
+    /// Generate terrain with random heights in [0, max_height]
     pub fn generate_random(&mut self, max_height: u8) {
+        self.max_height = max_height;
         let mut rng = rand::rng();
         for i in 0..self.rows {
             for j in 0..self.cols {
@@ -47,6 +52,7 @@ mod tests {
         let t = Terrain::new(4, 6);
         assert_eq!(t.rows, 4);
         assert_eq!(t.cols, 6);
+        assert_eq!(t.max_height, 0);
         assert!(t.heights.iter().flatten().all(|&h| h == 0));
     }
 
@@ -54,6 +60,7 @@ mod tests {
     fn random_values_within_bounds() {
         let mut t = Terrain::new(16, 16);
         t.generate_random(7);
+        assert_eq!(t.max_height, 7);
         assert!(t.heights.iter().flatten().all(|&h| h <= 7));
         // Run a few times to guarantee randomness (all-zero is nearly impossible)
         let mut saw_nonzero = false;
