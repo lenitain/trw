@@ -1,7 +1,8 @@
 use clap::Parser;
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers,
+            KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -14,12 +15,12 @@ use ratatui::{
 use ratatui_wireframe::model::Model;
 
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     error::Error,
     io::{self},
     sync::mpsc::{self},
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 // Standard TRW algorithm: used only to snapshot the deterministic equilibrium exactly at convergence (not part of any UI/key handling)
@@ -39,11 +40,7 @@ use view::ViewState;
 // Wireforge constants
 const ROT_RATE: f64 = 169.0 / 128.0;
 const MOVE_RATE: f64 = 83.0 / 128.0;
-const PRESS_ROT_STEP: f64 = 7.0 / 128.0;
-const PRESS_MOVE_FRACTION: f64 = 33.0 / 256.0;
 const SPIN_RATE: f64 = 169.0 / 256.0;
-const TAP_TIMEOUT: Duration = Duration::from_millis(600);
-const HOLD_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Motion state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -63,11 +60,6 @@ enum Motion {
 }
 
 /// Motion input state
-#[derive(Debug, Clone, Copy)]
-struct MotionInput {
-    steady: bool,
-    last: Instant,
-}
 
 /// Map key to motion
 fn motion_for(code: KeyCode, shift: bool) -> Option<Motion> {
@@ -126,7 +118,7 @@ impl Engine {
 struct App {
     // View state
     view: ViewState,
-    held: HashMap<Motion, MotionInput>,
+    held: HashSet<Motion>,
     auto_spin: bool,
     hud: Hud,
     show_axes: bool,
@@ -165,7 +157,7 @@ impl App {
         };
         App {
             view,
-            held: HashMap::new(),
+            held: HashSet::new(),
             auto_spin: false,
             hud: Hud::Collapsed,
             show_axes: true,
@@ -269,7 +261,7 @@ impl App {
         if !self.raining {
             // guard: never converge when no rain has fallen / no water exists (avoid misjudging dry land)
             let has_water = self.physics.water.total_water() > 0.0;
-            let no_more_flow = self.physics.residual() < 0.05;
+            let no_more_flow = self.physics.converged(dt);
             let all_settled = !self
                 .particles
                 .particles
@@ -294,7 +286,14 @@ impl App {
     fn handle_input(&mut self, ev: Event) -> bool {
         if let Event::Key(key) = ev {
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-            let now = Instant::now();
+            // Kitty keyboard protocol: a Release event stops the motion immediately.
+            if key.kind == KeyEventKind::Release {
+                if let Some(m) = motion_for(key.code, shift) {
+                    self.held.remove(&m);
+                    self.dirty = true;
+                }
+                return false;
+            }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return true,
                 KeyCode::Char('?') => {
@@ -343,20 +342,9 @@ impl App {
                 // Motion keys
                 _ => {
                     if let Some(m) = motion_for(key.code, shift) {
-                        let ms = view::model_extent(&self.terrain_model);
-                        if let Some(st) = self.held.get_mut(&m) {
-                            st.steady = true;
-                            st.last = now;
-                        } else {
-                            press_step(&mut self.view, m, ms);
-                            self.held.insert(
-                                m,
-                                MotionInput {
-                                    steady: false,
-                                    last: now,
-                                },
-                            );
-                        }
+                        // Press/Repeat: the key is held. Continuous motion is applied by
+                        // update_held each frame with dt; Release is handled above.
+                        self.held.insert(m);
                         self.dirty = true;
                     }
                 }
@@ -366,26 +354,20 @@ impl App {
     }
 
     /// Update held motion state
-    fn update_held(&mut self, now: Instant, dt: f64) {
+    /// Apply continuous motion to every held key each frame (dt-scaled).
+    /// Keys are added on Press/Repeat and removed on Release (Kitty protocol).
+    fn update_held(&mut self, dt: f64) {
+        if self.held.is_empty() {
+            return;
+        }
         let ms = view::model_extent(&self.terrain_model);
-        let mut stopped: Vec<Motion> = Vec::new();
-        for (m, st) in self.held.iter_mut() {
-            let timeout = if st.steady { HOLD_TIMEOUT } else { TAP_TIMEOUT };
-            if now.duration_since(st.last) > timeout {
-                stopped.push(*m);
-            } else if st.steady {
-                continuous_step(&mut self.view, *m, ms, dt);
-            }
+        for m in &self.held {
+            continuous_step(&mut self.view, *m, ms, dt);
         }
-        for m in stopped {
-            self.held.remove(&m);
-        }
+        // Held keys need a redraw every frame, otherwise the continuous motion
+        // is applied but never shown until the next key event.
+        self.dirty = true;
     }
-}
-
-/// Single press step
-fn press_step(v: &mut ViewState, m: Motion, scale: f64) {
-    apply_motion_step(v, m, PRESS_ROT_STEP, scale * PRESS_MOVE_FRACTION);
 }
 
 /// Continuous held step
@@ -454,13 +436,13 @@ const HELP: &[&str] = &[
     "=== keys ===",
     "",
     "Rotate:",
-    "  yaw left  <- / h        yaw right  -> / l",
-    "  pitch up  ^ / k         pitch down v / j",
+    "  yaw left  ← / h        yaw right  → / l",
+    "  pitch up  ↑ / k         pitch down ↓ / j",
     "  roll      r / e",
     "",
     "Move:",
-    "  left      Shift+<- / h  right      Shift+-> / l",
-    "  up        Shift+^ / k   down       Shift+v / j",
+    "  left      Shift+← / h  right      Shift+→ / l",
+    "  up        Shift+↑ / k   down       Shift+↓ / j",
     "  nearer    =             farther    -",
     "",
     "Keys:",
@@ -616,6 +598,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, Hide)?;
+    // Enable the Kitty keyboard protocol for Press/Repeat/Release key events.
+    execute!(stdout, PushKeyboardEnhancementFlags(
+        KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+    ))?;
 
     let (tx, rx) = mpsc::channel::<Event>();
 
@@ -665,14 +653,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 continue;
             }
             if app.handle_input(ev) {
-                execute!(stdout, Show, LeaveAlternateScreen)?;
+                execute!(stdout, PopKeyboardEnhancementFlags, Show, LeaveAlternateScreen)?;
                 disable_raw_mode()?;
                 return Ok(());
             }
         }
 
         // Update held keys
-        app.update_held(now, dt);
+        app.update_held(dt);
 
         // Auto spin
         if app.auto_spin {
@@ -705,7 +693,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             app.dirty = false;
         }
 
-        thread::sleep(Duration::from_millis(16)); // ~60 FPS
     }
 }
 

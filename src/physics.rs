@@ -184,7 +184,7 @@ impl Physics {
 
     /// Particle falling: sort each cell's particles by z; layer k's target = terrain + k/N, then fall.
     ///
-    /// Performance (vs. a full per-cell scan O(cells×n)):
+    /// Performance (vs. a full per-cell scan O(cellsxn)):
     /// - **Single-pass grouping** (O(n)): scan all particles once per frame, grouped by cell;
     ///   each cell only handles its own particles; no repeated full scans per cell.
     /// - **Parallel sorting**: each cell's sort is disjoint, so sorting is parallelized with rayon.
@@ -327,6 +327,17 @@ impl Physics {
         self.water.residual
     }
 
+    /// Whether flow/drainage has effectively stopped (frame-rate independent).
+    ///
+    /// The per-frame `residual` scales with `dt` (flow = rate x dt), so an
+    /// absolute per-frame threshold would trigger at a different remaining
+    /// water level depending on the frame pacing. Normalizing to a per-second
+    /// flow rate keeps the convergence quality identical at any frame rate.
+    /// 3.125 units/sec == the old 0.05-per-16ms-frame threshold.
+    pub fn converged(&self, dt: f64) -> bool {
+        self.residual() / dt.max(1e-9) < 3.125
+    }
+
     /// TRW equilibrium of the current terrain (units) — internal use only for convergence checks; not part of any UI
     pub fn equilibrium_units(&self, terrain: &Terrain) -> usize {
         TrappingRainWater::calculate(&terrain.heights)
@@ -403,7 +414,7 @@ mod tests {
             loop {
                 physics.update(&mut particles, &terrain, 0.016);
                 frame += 1;
-                if (physics.residual() < 0.05
+                if (physics.converged(0.016)
                     && (physics.total_water_units() - answer as f64).abs() <= 1.0)
                     || frame > 200_000
                 {
@@ -488,7 +499,7 @@ mod tests {
         loop {
             physics.update(&mut particles, &terrain, 0.016);
             frame += 1;
-            if physics.residual() < 0.05 && (physics.total_water_units() - 12.0).abs() <= 1.0 {
+            if physics.converged(0.016) && (physics.total_water_units() - 12.0).abs() <= 1.0 {
                 break;
             }
             assert!(frame < 200_000, "did not converge in {frame} frames");
@@ -531,3 +542,43 @@ mod tests {
         assert!(particles.count() > 0);
     }
 }
+
+    #[test]
+    fn convergence_is_frame_rate_independent() {
+        let mut terrain = Terrain::new(4, 4);
+        terrain.heights = vec![
+            vec![3, 3, 3, 3],
+            vec![3, 0, 0, 3],
+            vec![3, 0, 0, 3],
+            vec![3, 3, 3, 3],
+        ];
+        let answer = TrappingRainWater::calculate(&terrain.heights);
+        assert_eq!(answer, 12);
+
+        // Identical rain, run at very different frame dts: the rate-normalized
+        // convergence check must reach the same deterministic result either way.
+        for dt in [0.016, 0.001] {
+            let mut physics = Physics::new(4, 4);
+            let mut particles = ParticleSystem::new();
+            let mut rng = rand::rng();
+            for _ in 0..20_000 {
+                let r = rng.random_range(0..4);
+                let c = rng.random_range(0..4);
+                physics.water.add_water(r, c, 1.0);
+            }
+            let mut frame = 0;
+            loop {
+                physics.update(&mut particles, &terrain, dt);
+                frame += 1;
+                if (physics.converged(dt)
+                    && (physics.total_water_units() - answer as f64).abs() <= 1.0)
+                    || frame > 200_000
+                {
+                    break;
+                }
+            }
+            assert!(frame < 200_000, "did not converge in {frame} frames (dt={dt})");
+            let total = physics.finalize(&mut particles, &terrain);
+            assert_eq!(total, answer, "dt={dt} finalized total={total}");
+        }
+    }
