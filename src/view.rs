@@ -4,6 +4,11 @@ use rayon::prelude::*;
 /// Vertical field of view in degrees.
 pub const FOV_DEG: f64 = 60.0;
 
+/// Above this vertex count, projection and bounds switch to the rayon
+/// parallel path (wireforge measured crossover ~72k; typical trw scenes,
+/// even during heavy rain, stay well below this and run serial).
+const PARALLEL_THRESHOLD: usize = 100_000;
+
 /// Auto-fit headroom: the model fills 1/FIT_MARGIN of the screen height.
 pub const FIT_MARGIN: f64 = 2.0;
 
@@ -119,26 +124,41 @@ impl ViewState {
     }
 }
 
-/// Bounding box of the model (computed with a rayon parallel reduction; cheaper with many vertices).
+/// Bounding box of the model: `(min, max)` corners.
 pub fn bounds(m: &Model) -> ([f64; 3], [f64; 3]) {
-    let init = || ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
-    m.vertices
-        .par_iter()
-        .fold(init, |(mut mn, mut mx), &(x, y, z)| {
-            mn[0] = mn[0].min(x);
-            mn[1] = mn[1].min(y);
-            mn[2] = mn[2].min(z);
-            mx[0] = mx[0].max(x);
-            mx[1] = mx[1].max(y);
-            mx[2] = mx[2].max(z);
-            (mn, mx)
-        })
-        .reduce(init, |(a1, a2), (b1, b2)| {
-            (
-                [a1[0].min(b1[0]), a1[1].min(b1[1]), a1[2].min(b1[2])],
-                [a2[0].max(b2[0]), a2[1].max(b2[1]), a2[2].max(b2[2])],
-            )
-        })
+    if m.vertices.len() >= PARALLEL_THRESHOLD {
+        // rayon: per-vertex min/max is an independent reduction (large models).
+        let init = || ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        m.vertices
+            .par_iter()
+            .fold(init, |(mut mn, mut mx), &(x, y, z)| {
+                mn[0] = mn[0].min(x);
+                mn[1] = mn[1].min(y);
+                mn[2] = mn[2].min(z);
+                mx[0] = mx[0].max(x);
+                mx[1] = mx[1].max(y);
+                mx[2] = mx[2].max(z);
+                (mn, mx)
+            })
+            .reduce(init, |(a1, a2), (b1, b2)| {
+                (
+                    [a1[0].min(b1[0]), a1[1].min(b1[1]), a1[2].min(b1[2])],
+                    [a2[0].max(b2[0]), a2[1].max(b2[1]), a2[2].max(b2[2])],
+                )
+            })
+    } else {
+        let mut min = [f64::INFINITY; 3];
+        let mut max = [f64::NEG_INFINITY; 3];
+        for &(x, y, z) in &m.vertices {
+            min[0] = min[0].min(x);
+            min[1] = min[1].min(y);
+            min[2] = min[2].min(z);
+            max[0] = max[0].max(x);
+            max[1] = max[1].max(y);
+            max[2] = max[2].max(z);
+        }
+        (min, max)
+    }
 }
 
 /// The model's geometric-mean length.
@@ -187,11 +207,34 @@ pub fn project_batch(
     let py = v.pan_y;
     let dist = v.dist;
     let (cx, cy, cz) = (v.center[0], v.center[1], v.center[2]);
-    // rayon parallelism: vertex projections are independent of each other (the render vertex bottleneck).
-    // First map out each vertex's result (pure function, no shared mutable state), then write back sequentially.
-    let results: Vec<(bool, [f64; 2], f32)> = verts
-        .par_iter()
-        .map(|p| {
+    if verts.len() >= PARALLEL_THRESHOLD {
+        // rayon parallelism: vertex projections are independent of each other (the render vertex bottleneck).
+        // First map out each vertex's result (pure function, no shared mutable state), then write back sequentially.
+        let results: Vec<(bool, [f64; 2], f32)> = verts
+            .par_iter()
+            .map(|p| {
+                // First translate near the rotation center, then rotate around it
+                let (dx, dy, dz) = (p.0 - cx, p.1 - cy, p.2 - cz);
+                let rx = r[0][0] * dx + r[0][1] * dy + r[0][2] * dz + px;
+                let ry = r[1][0] * dx + r[1][1] * dy + r[1][2] * dz + py;
+                let rz = r[2][0] * dx + r[2][1] * dy + r[2][2] * dz;
+                let z = dist - rz;
+                if z <= 0.1 {
+                    return (false, [0.0; 2], f32::MAX);
+                }
+                let (dx, dy) = (rx - px, ry - py);
+                let rxr = px + dx * cr - dy * sr;
+                let ryr = py + dx * sr + dy * cr;
+                (true, [f * rxr / z, f * ryr / z], z as f32)
+            })
+            .collect();
+        for (i, (is_ok, pt, depth)) in results.into_iter().enumerate() {
+            out[i] = pt;
+            ok[i] = is_ok;
+            depths[i] = depth;
+        }
+    } else {
+        for (i, p) in verts.iter().enumerate() {
             // First translate near the rotation center, then rotate around it
             let (dx, dy, dz) = (p.0 - cx, p.1 - cy, p.2 - cz);
             let rx = r[0][0] * dx + r[0][1] * dy + r[0][2] * dz + px;
@@ -199,18 +242,18 @@ pub fn project_batch(
             let rz = r[2][0] * dx + r[2][1] * dy + r[2][2] * dz;
             let z = dist - rz;
             if z <= 0.1 {
-                return (false, [0.0; 2], f32::MAX);
+                ok[i] = false;
+                out[i] = [0.0; 2];
+                depths[i] = f32::MAX;
+                continue;
             }
             let (dx, dy) = (rx - px, ry - py);
             let rxr = px + dx * cr - dy * sr;
             let ryr = py + dx * sr + dy * cr;
-            (true, [f * rxr / z, f * ryr / z], z as f32)
-        })
-        .collect();
-    for (i, (is_ok, pt, depth)) in results.into_iter().enumerate() {
-        out[i] = pt;
-        ok[i] = is_ok;
-        depths[i] = depth;
+            out[i] = [f * rxr / z, f * ryr / z];
+            ok[i] = true;
+            depths[i] = z as f32;
+        }
     }
 }
 

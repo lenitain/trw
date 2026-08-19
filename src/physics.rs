@@ -5,6 +5,10 @@ use crate::water::WaterSimulation;
 use rand::RngExt;
 use rayon::prelude::*;
 
+/// Above this many particles, per-cell sorting switches to the rayon
+/// parallel path; typical rain stays far below this and sorts serially.
+const PARALLEL_SORT_THRESHOLD: usize = 4096;
+
 /// Physics simulator
 ///
 /// Unit conventions (consistent with WaterSimulation; the single source of truth is water.particles_per_cell):
@@ -206,9 +210,11 @@ impl Physics {
             }
         }
 
-        // parallel sort (each cell's index set is disjoint; z is read-only): low to high by height -> determine each layer
-        {
-            let ps = &particles.particles;
+        // per-cell sort (each cell's index set is disjoint; z is read-only): low to high by height -> determine each layer.
+        // Only parallelize for large particle counts; below the threshold rayon's per-chunk
+        // overhead exceeds the sort itself (typical rain stays well under it).
+        let ps = &particles.particles;
+        if particles.particles.len() >= PARALLEL_SORT_THRESHOLD {
             groups.par_iter_mut().for_each(|idxs| {
                 idxs.sort_by(|&a, &b| {
                     ps[a]
@@ -217,6 +223,15 @@ impl Physics {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
             });
+        } else {
+            for idxs in groups.iter_mut() {
+                idxs.sort_by(|&a, &b| {
+                    ps[a]
+                        .z
+                        .partial_cmp(&ps[b].z)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
         }
 
         for (cell, idxs) in groups.iter_mut().enumerate() {

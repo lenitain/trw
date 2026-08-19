@@ -22,7 +22,7 @@ use std::{
     io::{self},
     sync::mpsc::{self},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 // Standard TRW algorithm: used only to snapshot the deterministic equilibrium exactly at convergence (not part of any UI/key handling)
@@ -43,6 +43,9 @@ use view::ViewState;
 const ROT_RATE: f64 = 169.0 / 128.0;
 const MOVE_RATE: f64 = 83.0 / 128.0;
 const SPIN_RATE: f64 = 169.0 / 256.0;
+/// How often the idle loop re-checks the terminal size (resize fallback; crossterm
+/// also delivers Event::Resize directly, this poll is only for terminals that don't).
+const RESIZE_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Motion state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -637,69 +640,119 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut last = Instant::now();
 
-    loop {
+    // Two-mode loop (Wireforge-style): animating = drain + update + render as
+    // fast as possible; idle = block in the channel until an event or the
+    // periodic resize fallback wakes us (the thread is parked in the kernel,
+    // 0% CPU). This keeps the loop from pegging every core when nothing moves.
+    'main: loop {
         let now = Instant::now();
         let dt = (now - last).as_secs_f64().min(0.1);
         last = now;
 
-        // Handle resize
-        if let Ok((new_cols, new_rows)) = crossterm::terminal::size()
-            && (new_cols as usize != engine.screen.size().0
-                || new_rows as usize != engine.screen.size().1)
-        {
-            engine.resize(new_cols as usize, new_rows as usize);
-            app.dirty = true;
-        }
+        // True when the next frame can change something (view motion, live
+        // physics, or rain). Settled water is frozen, so it is NOT animating.
+        let physics_active = (app.raining
+            || !app.particles.particles.is_empty()
+            || app.physics.water.total_water() > 0.0)
+            && !app.paused
+            && !app.settled;
+        let animating = app.auto_spin || !app.held.is_empty() || physics_active;
 
-        // Drain input
-        while let Ok(ev) = rx.try_recv() {
-            if let Event::Resize(cols, rows) = ev {
-                engine.resize(cols as usize, rows as usize);
+        if animating {
+            // Handle resize
+            if let Ok((new_cols, new_rows)) = crossterm::terminal::size()
+                && (new_cols as usize != engine.screen.size().0
+                    || new_rows as usize != engine.screen.size().1)
+            {
+                engine.resize(new_cols as usize, new_rows as usize);
                 app.dirty = true;
-                continue;
             }
-            if app.handle_input(ev) {
-                let _ = execute!(stdout, PopKeyboardEnhancementFlags);
-                execute!(stdout, Show, LeaveAlternateScreen)?;
-                disable_raw_mode()?;
-                return Ok(());
+
+            // Drain input
+            while let Ok(ev) = rx.try_recv() {
+                if let Event::Resize(cols, rows) = ev {
+                    engine.resize(cols as usize, rows as usize);
+                    app.dirty = true;
+                    continue;
+                }
+                if app.handle_input(ev) {
+                    break 'main;
+                }
             }
-        }
 
-        // Update held keys
-        app.update_held(dt);
+            // Update held keys
+            app.update_held(dt);
 
-        // Auto spin
-        if app.auto_spin {
-            app.view.spin_local(SPIN_RATE * dt);
-            app.view.normalize();
-            app.dirty = true;
-        }
+            // Auto spin
+            if app.auto_spin {
+                app.view.spin_local(SPIN_RATE * dt);
+                app.view.normalize();
+                app.dirty = true;
+            }
 
-        // Spawn rain particles
-        if app.raining && !app.paused {
-            app.spawn_particles(dt);
-        }
+            // Spawn rain particles
+            if app.raining && !app.paused {
+                app.spawn_particles(dt);
+            }
 
-        // Update physics
-        let had_particles = !app.particles.particles.is_empty();
-        let had_water = app.physics.water.total_water() > 0.0;
-        app.update_physics(dt);
-        if !app.particles.particles.is_empty()
-            || had_particles
-            || app.physics.water.total_water() > 0.0
-            || had_water
-        {
-            app.rebuild_water_model();
-            app.dirty = true;
-        }
+            // Update physics (only when there is something to simulate; avoids
+            // feeding the rayon pool with empty parallel jobs during pure view motion)
+            let had_particles = !app.particles.particles.is_empty();
+            let had_water = app.physics.water.total_water() > 0.0;
+            if physics_active {
+                app.update_physics(dt);
+            }
+            if !app.particles.particles.is_empty()
+                || had_particles
+                || app.physics.water.total_water() > 0.0
+                || had_water
+            {
+                app.rebuild_water_model();
+                app.dirty = true;
+            }
 
-        // Render if dirty
-        if app.dirty {
-            render_frame(&mut app, &mut engine, &mut stdout)?;
-            app.dirty = false;
+            // Render if dirty
+            if app.dirty {
+                render_frame(&mut app, &mut engine, &mut stdout)?;
+                app.dirty = false;
+            }
+        } else {
+            // Idle: block in the channel until an input event or the resize
+            // fallback — the thread is parked in the kernel (0% CPU).
+            match rx.recv_timeout(RESIZE_CHECK_INTERVAL) {
+                Ok(Event::Resize(cols, rows)) => {
+                    engine.resize(cols as usize, rows as usize);
+                    app.dirty = true;
+                }
+                Ok(ev) => {
+                    if app.handle_input(ev) {
+                        break 'main;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Periodic resize fallback.
+                    if let Ok((new_cols, new_rows)) = crossterm::terminal::size()
+                        && (new_cols as usize != engine.screen.size().0
+                            || new_rows as usize != engine.screen.size().1)
+                    {
+                        engine.resize(new_cols as usize, new_rows as usize);
+                        app.dirty = true;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break 'main,
+            }
+            // Redraw only when something actually changed (dirty-flag).
+            if app.dirty {
+                render_frame(&mut app, &mut engine, &mut stdout)?;
+                app.dirty = false;
+            }
         }
     }
+
+    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    execute!(stdout, Show, LeaveAlternateScreen)?;
+    disable_raw_mode()?;
+    Ok(())
 }
 
 /// The Wireforge rendering engine (Screen, Rasterizer, etc.)
