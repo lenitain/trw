@@ -600,14 +600,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, Hide)?;
     // Enable the Kitty keyboard protocol for Press/Repeat/Release key events.
-    execute!(
+    // Keyboard enhancement (kitty protocol) is optional: terminals that don't
+    // support it (e.g. the legacy Windows console API) run without it.
+    let _ = execute!(
         stdout,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::REPORT_EVENT_TYPES
                 | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
                 | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         )
-    )?;
+    );
 
     let (tx, rx) = mpsc::channel::<Event>();
 
@@ -657,12 +659,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 continue;
             }
             if app.handle_input(ev) {
-                execute!(
-                    stdout,
-                    PopKeyboardEnhancementFlags,
-                    Show,
-                    LeaveAlternateScreen
-                )?;
+                let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+                execute!(stdout, Show, LeaveAlternateScreen)?;
                 disable_raw_mode()?;
                 return Ok(());
             }
