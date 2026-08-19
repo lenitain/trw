@@ -1,8 +1,10 @@
 use clap::Parser;
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers,
-            KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
+    event::{
+        self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -60,7 +62,6 @@ enum Motion {
 }
 
 /// Motion input state
-
 /// Map key to motion
 fn motion_for(code: KeyCode, shift: bool) -> Option<Motion> {
     use KeyCode::*;
@@ -599,11 +600,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, Hide)?;
     // Enable the Kitty keyboard protocol for Press/Repeat/Release key events.
-    execute!(stdout, PushKeyboardEnhancementFlags(
-        KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-            | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-            | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-    ))?;
+    execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
+    )?;
 
     let (tx, rx) = mpsc::channel::<Event>();
 
@@ -653,7 +657,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 continue;
             }
             if app.handle_input(ev) {
-                execute!(stdout, PopKeyboardEnhancementFlags, Show, LeaveAlternateScreen)?;
+                execute!(
+                    stdout,
+                    PopKeyboardEnhancementFlags,
+                    Show,
+                    LeaveAlternateScreen
+                )?;
                 disable_raw_mode()?;
                 return Ok(());
             }
@@ -692,7 +701,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             render_frame(&mut app, &mut engine, &mut stdout)?;
             app.dirty = false;
         }
-
     }
 }
 

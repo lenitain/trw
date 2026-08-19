@@ -543,42 +543,44 @@ mod tests {
     }
 }
 
-    #[test]
-    fn convergence_is_frame_rate_independent() {
-        let mut terrain = Terrain::new(4, 4);
-        terrain.heights = vec![
-            vec![3, 3, 3, 3],
-            vec![3, 0, 0, 3],
-            vec![3, 0, 0, 3],
-            vec![3, 3, 3, 3],
-        ];
-        let answer = TrappingRainWater::calculate(&terrain.heights);
-        assert_eq!(answer, 12);
+#[test]
+fn convergence_is_frame_rate_independent() {
+    let mut terrain = Terrain::new(4, 4);
+    terrain.heights = vec![
+        vec![3, 3, 3, 3],
+        vec![3, 0, 0, 3],
+        vec![3, 0, 0, 3],
+        vec![3, 3, 3, 3],
+    ];
+    let answer = TrappingRainWater::calculate(&terrain.heights);
+    assert_eq!(answer, 12);
 
-        // Identical rain, run at very different frame dts: the rate-normalized
-        // convergence check must reach the same deterministic result either way.
-        for dt in [0.016, 0.001] {
-            let mut physics = Physics::new(4, 4);
-            let mut particles = ParticleSystem::new();
-            let mut rng = rand::rng();
-            for _ in 0..20_000 {
-                let r = rng.random_range(0..4);
-                let c = rng.random_range(0..4);
-                physics.water.add_water(r, c, 1.0);
-            }
-            let mut frame = 0;
-            loop {
-                physics.update(&mut particles, &terrain, dt);
-                frame += 1;
-                if (physics.converged(dt)
-                    && (physics.total_water_units() - answer as f64).abs() <= 1.0)
-                    || frame > 200_000
-                {
-                    break;
-                }
-            }
-            assert!(frame < 200_000, "did not converge in {frame} frames (dt={dt})");
-            let total = physics.finalize(&mut particles, &terrain);
-            assert_eq!(total, answer, "dt={dt} finalized total={total}");
+    // Identical rain, run at very different frame dts: the rate-normalized
+    // convergence check must reach the same deterministic result either way.
+    for dt in [0.016, 0.001] {
+        let mut physics = Physics::new(4, 4);
+        let mut particles = ParticleSystem::new();
+        let mut rng = rand::rng();
+        for _ in 0..20_000 {
+            let r = rng.random_range(0..4);
+            let c = rng.random_range(0..4);
+            physics.water.add_water(r, c, 1.0);
         }
+        let mut frame = 0;
+        loop {
+            physics.update(&mut particles, &terrain, dt);
+            frame += 1;
+            if (physics.converged(dt) && (physics.total_water_units() - answer as f64).abs() <= 1.0)
+                || frame > 200_000
+            {
+                break;
+            }
+        }
+        assert!(
+            frame < 200_000,
+            "did not converge in {frame} frames (dt={dt})"
+        );
+        let total = physics.finalize(&mut particles, &terrain);
+        assert_eq!(total, answer, "dt={dt} finalized total={total}");
     }
+}
